@@ -1,0 +1,10 @@
+# Core dependencies for the BasicAI agent framework
+httpx>=0.24.0
+python-dotenv>=1.0.0
+
+# Optional: aiohttp as alternative HTTP client
+aiohttp>=3.8.0
+
+# Development and testing dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

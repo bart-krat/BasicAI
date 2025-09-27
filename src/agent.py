@@ -5,7 +5,7 @@ This module provides a simplified interface for interacting with different LLM p
 """
 
 from typing import Optional, Dict, Any, AsyncGenerator
-from .api import LLMFactory, Message, LLMResponse
+from api import LLMFactory, Message, LLMResponse
 import os
 from dotenv import load_dotenv
 
@@ -161,6 +161,27 @@ class Agent:
         )
         
         return response.content
+
+
+    async def start_chat(self, system_message: str = "You are a helpful assistant."):
+        """Start an interactive chat session"""
+        conversation = [{"role": "system", "content": system_message}]
+    
+        while True:
+            user_input = input("\nYou: ").strip()
+            if user_input.lower() == 'quit':
+                break
+            
+            # Add user message
+            conversation.append({"role": "user", "content": user_input})
+            
+            # Get AI response - THIS IS WHERE IT USES chat()
+            response = await self.chat(conversation)  # ← Uses chat() internally
+            
+            print(f"AI: {response}")
+            
+            # Add AI response
+            conversation.append({"role": "assistant", "content": response})
     
     def get_info(self) -> Dict[str, Any]:
         """Get information about the agent"""

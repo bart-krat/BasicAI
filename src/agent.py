@@ -5,7 +5,7 @@ This module provides a modular agent interface with direct injection of componen
 like state management, tools, context, and MCP clients.
 """
 
-from typing import Optional, Dict, Any, AsyncGenerator
+from typing import Optional, Dict, Any, AsyncGenerator, List
 from api import LLMFactory, Message, LLMResponse
 from state import StateManager
 from tools import ToolManager

@@ -9,6 +9,8 @@ import asyncio
 import inspect
 import json
 import time
+import ast
+import operator
 from typing import Any, Dict, List, Optional, Callable, Union, Type, Generic, TypeVar
 from datetime import datetime
 import hashlib
@@ -110,14 +112,19 @@ class ToolMetadata(BaseModel):
         return [tag.strip().lower() for tag in v if tag.strip()]
 
 class Tool(BaseModel):
-    """A tool definition with comprehensive Pydantic validation"""
+    """
+    A tool definition with comprehensive Pydantic validation
+    
+    Note: The actual function is stored separately in ToolManager's function registry
+    to maintain serialization compatibility.
+    """
     name: str = Field(..., min_length=1, max_length=100, description="Tool name")
     description: str = Field(..., min_length=1, max_length=500, description="Tool description")
-    function: Callable = Field(..., description="Function to execute")
     input_schema: Optional[Type[BaseModel]] = Field(None, description="Pydantic model for input validation")
     output_schema: Optional[Type[BaseModel]] = Field(None, description="Pydantic model for output validation")
     category: Optional[str] = Field(None, max_length=50, description="Tool category")
     metadata: ToolMetadata = Field(default_factory=ToolMetadata, description="Tool metadata")
+    is_async: bool = Field(default=False, description="Whether the function is async")
     
     @validator('name')
     def validate_name(cls, v):
@@ -134,18 +141,19 @@ class Tool(BaseModel):
         return v
     
     class Config:
-        arbitrary_types_allowed = True  # Allow Callable type
+        arbitrary_types_allowed = True  # For Type[BaseModel]
         json_encoders = {
             datetime: lambda v: v.isoformat()
         }
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary"""
+        """Convert to dictionary for serialization"""
         result = {
             'name': self.name,
             'description': self.description,
             'category': self.category,
-            'metadata': self.metadata.dict()
+            'metadata': self.metadata.dict(),
+            'is_async': self.is_async
         }
         
         # Add Pydantic schemas
@@ -230,18 +238,21 @@ class ToolManager(BaseModel):
     - Tool categorization and metadata management
     - Tool discovery based on context
     - Automatic input/output validation
+    - Separate function registry for serialization compatibility
     """
     
     tools: Dict[str, Tool] = Field(default_factory=dict, description="Registered tools")
     auto_discover: bool = Field(default=True, description="Auto-discover default tools")
+    _functions: Dict[str, Callable] = Field(default_factory=dict, exclude=True, description="Function registry")
     _lock: Optional[asyncio.Lock] = Field(default=None, exclude=True)
     
     class Config:
-        arbitrary_types_allowed = True  # Allow asyncio.Lock
+        arbitrary_types_allowed = True  # Allow asyncio.Lock and Callable
     
     def __init__(self, auto_discover: bool = True, **kwargs):
         """Initialize tool manager with Pydantic validation"""
         super().__init__(auto_discover=auto_discover, **kwargs)
+        self._functions = {}
         self._lock = asyncio.Lock()
         
         # Register default tools if auto_discover is enabled
@@ -325,18 +336,24 @@ class ToolManager(BaseModel):
         if not input_schema and not output_schema:
             raise ValueError("At least one schema (input_schema or output_schema) must be provided")
         
-        # Create tool with Pydantic validation
+        # Detect if function is async
+        is_async = asyncio.iscoroutinefunction(function)
+        
+        # Create tool metadata (without function for serialization)
         tool = Tool(
             name=name,
             description=description,
-            function=function,
             input_schema=input_schema,
             output_schema=output_schema,
             category=category,
-            metadata=metadata or ToolMetadata()
+            metadata=metadata or ToolMetadata(),
+            is_async=is_async
         )
         
+        # Store tool metadata and function separately
         self.tools[name] = tool
+        self._functions[name] = function
+        
         validation_info = []
         if input_schema:
             validation_info.append("input validation")
@@ -344,7 +361,8 @@ class ToolManager(BaseModel):
             validation_info.append("output validation")
         
         validation_str = f" with {', '.join(validation_info)}"
-        print(f"🔧 Registered tool with Pydantic{validation_str}: {name}")
+        async_str = " (async)" if is_async else ""
+        print(f"🔧 Registered tool with Pydantic{validation_str}{async_str}: {name}")
     
     def unregister_tool(self, name: str) -> bool:
         """
@@ -358,6 +376,8 @@ class ToolManager(BaseModel):
         """
         if name in self.tools:
             del self.tools[name]
+            if name in self._functions:
+                del self._functions[name]
             print(f"🗑️ Unregistered tool: {name}")
             return True
         return False
@@ -422,7 +442,11 @@ class ToolManager(BaseModel):
         if name not in self.tools:
             return ToolResult.error(name, f"Tool '{name}' not found")
         
+        if name not in self._functions:
+            return ToolResult.error(name, f"Function for tool '{name}' not found in registry")
+        
         tool = self.tools[name]
+        function = self._functions[name]
         start_time = time.time()
         
         try:
@@ -441,15 +465,15 @@ class ToolManager(BaseModel):
             
             # Execute tool with validated input
             if validated_input:
-                if asyncio.iscoroutinefunction(tool.function):
-                    raw_result = await tool.function(**validated_input.dict())
+                if tool.is_async:
+                    raw_result = await function(**validated_input.dict())
                 else:
-                    raw_result = tool.function(**validated_input.dict())
+                    raw_result = function(**validated_input.dict())
             else:
-                if asyncio.iscoroutinefunction(tool.function):
-                    raw_result = await tool.function(**parameters)
+                if tool.is_async:
+                    raw_result = await function(**parameters)
                 else:
-                    raw_result = tool.function(**parameters)
+                    raw_result = function(**parameters)
             
             # Validate output with Pydantic
             validated_output = None
@@ -457,10 +481,17 @@ class ToolManager(BaseModel):
             
             if tool.output_schema:
                 try:
-                    validated_output = tool.output_schema(**raw_result)
+                    # Handle Pydantic model outputs
+                    if isinstance(raw_result, BaseModel):
+                        validated_output = raw_result
+                    else:
+                        validated_output = tool.output_schema(**raw_result)
                 except ValidationError as e:
                     warnings.append(f"Output validation warning: {e}")
                     validated_output = raw_result  # Use raw result with warning
+                except TypeError as e:
+                    warnings.append(f"Output type error: {e}")
+                    validated_output = raw_result
             
             execution_time = time.time() - start_time
             
@@ -489,33 +520,16 @@ class ToolManager(BaseModel):
                 execution_time=execution_time
             )
     
-    def _validate_parameters(self, parameters: Dict[str, Any], schema: Dict[str, Any]) -> None:
-        """Validate parameters against JSON schema"""
-        # Basic validation - check required parameters
-        required = schema.get("required", [])
-        for param in required:
-            if param not in parameters:
-                raise ValueError(f"Required parameter '{param}' not provided")
-        
-        # Check parameter types
-        properties = schema.get("properties", {})
-        for param_name, param_value in parameters.items():
-            if param_name in properties:
-                param_schema = properties[param_name]
-                expected_type = param_schema.get("type")
-                
-                if expected_type == "string" and not isinstance(param_value, str):
-                    raise ValueError(f"Parameter '{param_name}' must be a string")
-                elif expected_type == "number" and not isinstance(param_value, (int, float)):
-                    raise ValueError(f"Parameter '{param_name}' must be a number")
-                elif expected_type == "boolean" and not isinstance(param_value, bool):
-                    raise ValueError(f"Parameter '{param_name}' must be a boolean")
-    
     # Default tool implementations with Pydantic models
     def _calculator(self, expression: str) -> CalculatorOutput:
-        """Calculator tool implementation"""
+        """
+        Safe calculator tool implementation using AST
+        
+        Only supports basic arithmetic operations: +, -, *, /, **, ()
+        Does NOT use eval() for security reasons.
+        """
         try:
-            result = eval(expression)
+            result = self._safe_eval(expression)
             return CalculatorOutput(
                 expression=expression,
                 result=result,
@@ -528,6 +542,66 @@ class ToolManager(BaseModel):
                 success=False,
                 error=str(e)
             )
+    
+    def _safe_eval(self, expression: str) -> float:
+        """
+        Safely evaluate a mathematical expression using AST
+        
+        Args:
+            expression: Mathematical expression string
+            
+        Returns:
+            Evaluated result as float
+            
+        Raises:
+            ValueError: If expression contains unsafe operations
+            SyntaxError: If expression is malformed
+        """
+        # Parse the expression into an AST
+        try:
+            node = ast.parse(expression, mode='eval')
+        except SyntaxError as e:
+            raise ValueError(f"Invalid expression syntax: {e}")
+        
+        # Evaluate the AST safely
+        return self._eval_node(node.body)
+    
+    def _eval_node(self, node):
+        """
+        Recursively evaluate an AST node
+        
+        Only allows safe mathematical operations.
+        """
+        # Supported operators
+        operators = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+        
+        if isinstance(node, ast.Constant):  # Numbers (Python 3.8+)
+            return node.value
+        elif isinstance(node, ast.Num):  # Numbers (Python 3.7 and earlier)
+            return node.n
+        elif isinstance(node, ast.BinOp):  # Binary operations like +, -, *, /
+            left = self._eval_node(node.left)
+            right = self._eval_node(node.right)
+            op_func = operators.get(type(node.op))
+            if op_func is None:
+                raise ValueError(f"Unsupported operation: {type(node.op).__name__}")
+            return op_func(left, right)
+        elif isinstance(node, ast.UnaryOp):  # Unary operations like -x
+            operand = self._eval_node(node.operand)
+            op_func = operators.get(type(node.op))
+            if op_func is None:
+                raise ValueError(f"Unsupported unary operation: {type(node.op).__name__}")
+            return op_func(operand)
+        else:
+            raise ValueError(f"Unsupported expression type: {type(node).__name__}")
     
     def _text_processor(self, text: str, operation: str) -> TextProcessorOutput:
         """Text processing tool implementation"""
@@ -590,11 +664,18 @@ class ToolManager(BaseModel):
         if not tool:
             return None
         
-        return {
+        schema = {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.parameters
         }
+        
+        # Add input schema if available
+        if tool.input_schema:
+            schema["parameters"] = tool.input_schema.schema()
+        else:
+            schema["parameters"] = {"type": "object", "properties": {}}
+        
+        return schema
     
     def get_all_schemas(self) -> List[Dict[str, Any]]:
         """Get all tool schemas for LLM function calling"""

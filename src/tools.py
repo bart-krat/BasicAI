@@ -11,6 +11,7 @@ import json
 import time
 import ast
 import operator
+import logging
 from typing import Any, Dict, List, Optional, Callable, Union, Type, Generic, TypeVar
 from datetime import datetime
 import hashlib
@@ -18,6 +19,9 @@ import hashlib
 # Required Pydantic imports
 from pydantic import BaseModel, Field, validator, ValidationError
 from enum import Enum
+
+# Set up logger
+logger = logging.getLogger(__name__)
 
 # Type variables for generic tool schemas
 TInput = TypeVar('TInput', bound=BaseModel)
@@ -243,17 +247,17 @@ class ToolManager(BaseModel):
     
     tools: Dict[str, Tool] = Field(default_factory=dict, description="Registered tools")
     auto_discover: bool = Field(default=True, description="Auto-discover default tools")
-    _functions: Dict[str, Callable] = Field(default_factory=dict, exclude=True, description="Function registry")
-    _lock: Optional[asyncio.Lock] = Field(default=None, exclude=True)
     
     class Config:
-        arbitrary_types_allowed = True  # Allow asyncio.Lock and Callable
+        arbitrary_types_allowed = True  # Allow Callable type
     
     def __init__(self, auto_discover: bool = True, **kwargs):
         """Initialize tool manager with Pydantic validation"""
         super().__init__(auto_discover=auto_discover, **kwargs)
-        self._functions = {}
-        self._lock = asyncio.Lock()
+        
+        # Initialize private function registry (not a Pydantic field)
+        # This stores actual executable functions separately from metadata
+        self._functions: Dict[str, Callable] = {}
         
         # Register default tools if auto_discover is enabled
         if auto_discover:
@@ -316,7 +320,7 @@ class ToolManager(BaseModel):
                                    input_schema: Optional[Type[BaseModel]] = None,
                                    output_schema: Optional[Type[BaseModel]] = None,
                                    category: Optional[str] = None,
-                                   metadata: Optional[ToolMetadata] = None) -> None:
+                                   metadata: Optional[ToolMetadata] = None) -> Tool:
         """
         Register a tool with Pydantic validation (REQUIRED)
         
@@ -328,6 +332,9 @@ class ToolManager(BaseModel):
             output_schema: Pydantic model for output validation
             category: Optional category for organization
             metadata: Optional tool metadata
+            
+        Returns:
+            The registered Tool object
         """
         if name in self.tools:
             raise ValueError(f"Tool '{name}' already registered")
@@ -354,15 +361,19 @@ class ToolManager(BaseModel):
         self.tools[name] = tool
         self._functions[name] = function
         
+        # Log registration (replaces print statements)
         validation_info = []
         if input_schema:
-            validation_info.append("input validation")
+            validation_info.append("input")
         if output_schema:
-            validation_info.append("output validation")
+            validation_info.append("output")
         
-        validation_str = f" with {', '.join(validation_info)}"
-        async_str = " (async)" if is_async else ""
-        print(f"🔧 Registered tool with Pydantic{validation_str}{async_str}: {name}")
+        logger.info(
+            f"Registered tool: {name} "
+            f"(async={is_async}, validated={','.join(validation_info)}, category={category})"
+        )
+        
+        return tool
     
     def unregister_tool(self, name: str) -> bool:
         """
@@ -378,7 +389,7 @@ class ToolManager(BaseModel):
             del self.tools[name]
             if name in self._functions:
                 del self._functions[name]
-            print(f"🗑️ Unregistered tool: {name}")
+            logger.info(f"Unregistered tool: {name}")
             return True
         return False
     
@@ -484,14 +495,25 @@ class ToolManager(BaseModel):
                     # Handle Pydantic model outputs
                     if isinstance(raw_result, BaseModel):
                         validated_output = raw_result
-                    else:
+                    elif isinstance(raw_result, dict):
+                        # Validate dict output
                         validated_output = tool.output_schema(**raw_result)
+                    else:
+                        # Handle non-dict returns (string, list, number, etc.)
+                        warnings.append(
+                            f"Tool returned {type(raw_result).__name__}, expected dict or BaseModel. "
+                            f"Output validation skipped."
+                        )
+                        validated_output = raw_result
                 except ValidationError as e:
-                    warnings.append(f"Output validation warning: {e}")
+                    warnings.append(f"Output validation failed: {e}")
                     validated_output = raw_result  # Use raw result with warning
                 except TypeError as e:
                     warnings.append(f"Output type error: {e}")
                     validated_output = raw_result
+            else:
+                # No output schema provided
+                validated_output = raw_result
             
             execution_time = time.time() - start_time
             

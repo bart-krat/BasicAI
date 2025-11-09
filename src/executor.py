@@ -239,10 +239,16 @@ class PlanExecutor:
                 metadata.status = StepStatus.COMPLETE
                 print(f"   ✅ Complete in {result.execution_time:.3f}s")
                 
-                # Store result in state
+                # Store result data in state (not the ToolResult wrapper)
+                # This makes variable resolution simpler: ${step_1.result} instead of ${step_1.data.result}
                 await self.state.set(step.output_key, result.data)
                 await self.state.set(f"{step_key}_metadata", metadata.dict())
-                await self.state.set(f"{step_key}_result", result.dict())
+                # Store full result for debugging (convert to dict for serialization)
+                result_dict = result.dict()
+                # Convert datetime to string for JSON serialization
+                if 'timestamp' in result_dict and isinstance(result_dict['timestamp'], datetime):
+                    result_dict['timestamp'] = result_dict['timestamp'].isoformat()
+                await self.state.set(f"{step_key}_result_full", result_dict)
                 
                 # Log execution
                 self._execution_log.append({
@@ -320,7 +326,14 @@ class PlanExecutor:
         return resolved
     
     async def _resolve_value(self, value: str) -> Any:
-        """Resolve a single value that might be a variable reference"""
+        """
+        Resolve a single value that might be a variable reference
+        
+        Supports:
+        - ${variable_name} - direct state lookup
+        - ${step_1.result} - navigate to nested attribute
+        - ${step_1.data.result} - multi-level navigation
+        """
         # Pattern: ${variable_name} or ${step_1.output}
         pattern = r'\$\{([^}]+)\}'
         match = re.search(pattern, value)
@@ -337,15 +350,25 @@ class PlanExecutor:
             # Get base value from state
             base_value = await self.state.get(parts[0])
             
+            if base_value is None:
+                raise ValueError(f"Variable not found in state: {parts[0]}")
+            
             # Navigate nested structure
             current = base_value
             for part in parts[1:]:
+                if current is None:
+                    raise ValueError(f"Cannot navigate path {var_path}: intermediate value is None")
+                
                 if isinstance(current, dict):
                     current = current.get(part)
                 elif hasattr(current, part):
                     current = getattr(current, part)
                 else:
-                    raise ValueError(f"Cannot resolve path: {var_path}")
+                    raise ValueError(
+                        f"Cannot resolve path '{var_path}' at part '{part}'. "
+                        f"Current type: {type(current).__name__}, "
+                        f"Available: {dir(current) if hasattr(current, '__dict__') else 'N/A'}"
+                    )
             
             return current
         else:

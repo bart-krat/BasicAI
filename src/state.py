@@ -148,12 +148,9 @@ class StateManager(BaseModel):
     auto_save: bool = Field(default=True, description="Auto-save to disk")
     max_memory_entries: int = Field(default=1000, ge=1, le=10000, description="Maximum memory entries")
     state_schema: Optional[StateSchema] = Field(None, description="State validation schema")
-    _state: Dict[str, StateEntry] = Field(default_factory=dict, exclude=True)
-    _state_file: Path = Field(exclude=True)
-    _lock: Optional[asyncio.Lock] = Field(default=None, exclude=True)
     
     class Config:
-        arbitrary_types_allowed = True  # Allow Path and asyncio.Lock
+        arbitrary_types_allowed = True  # Allow Path type
     
     def __init__(self, 
                  session_id: Optional[str] = None,
@@ -190,10 +187,10 @@ class StateManager(BaseModel):
             **kwargs
         )
         
-        # Initialize private attributes
-        self._state = {}
-        self._state_file = self.state_dir / f"state_{self.session_id}.json"
-        self._lock = asyncio.Lock()
+        # Initialize private attributes (not Pydantic fields due to underscore restriction)
+        self._state: Dict[str, StateEntry] = {}
+        self._state_file: Path = self.state_dir / f"state_{self.session_id}.json"
+        self._lock: asyncio.Lock = asyncio.Lock()
         
         # Load existing state if available
         self._load_state()
@@ -249,19 +246,27 @@ class StateManager(BaseModel):
             
         async with self._lock:
             try:
+                # Use Pydantic's JSON serialization which handles datetime
+                entries_data = []
+                for entry in self._state.values():
+                    entry_dict = entry.dict()
+                    # Convert datetime to ISO format string
+                    if isinstance(entry_dict.get('timestamp'), datetime):
+                        entry_dict['timestamp'] = entry_dict['timestamp'].isoformat()
+                    entries_data.append(entry_dict)
+                
                 data = {
                     'session_id': self.session_id,
                     'last_saved': datetime.now().isoformat(),
-                    'entries': [entry.to_dict() for entry in self._state.values()]
+                    'entries': entries_data
                 }
                 
                 # Write to temporary file first, then rename (atomic operation)
                 temp_file = self._state_file.with_suffix('.tmp')
                 with open(temp_file, 'w') as f:
-                    json.dump(data, f, indent=2)
+                    json.dump(data, f, indent=2, default=str)
                 
                 temp_file.rename(self._state_file)
-                print(f"💾 Saved {len(self._state)} state entries to {self._state_file}")
                 
             except Exception as e:
                 print(f"⚠️ Failed to save state: {e}")

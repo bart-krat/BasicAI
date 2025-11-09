@@ -72,7 +72,7 @@ class ToolResult(BaseModel):
         validate_assignment = True
     
     @classmethod
-    def success(cls, tool_name: str, data: Any, **kwargs) -> 'ToolResult':
+    def create_success(cls, tool_name: str, data: Any, **kwargs) -> 'ToolResult':
         """Create successful result"""
         return cls(
             tool_name=tool_name,
@@ -82,17 +82,17 @@ class ToolResult(BaseModel):
         )
     
     @classmethod
-    def error(cls, tool_name: str, error: str, **kwargs) -> 'ToolResult':
+    def create_error(cls, tool_name: str, error_msg: str, **kwargs) -> 'ToolResult':
         """Create error result"""
         return cls(
             tool_name=tool_name,
             status=ToolResultStatus.ERROR,
-            error=error,
+            error=error_msg,
             **kwargs
         )
     
     @classmethod
-    def partial(cls, tool_name: str, data: Any, warnings: List[str], **kwargs) -> 'ToolResult':
+    def create_partial(cls, tool_name: str, data: Any, warnings: List[str], **kwargs) -> 'ToolResult':
         """Create partial success result"""
         return cls(
             tool_name=tool_name,
@@ -451,10 +451,10 @@ class ToolManager(BaseModel):
             ValueError: If tool not found or validation fails
         """
         if name not in self.tools:
-            return ToolResult.error(name, f"Tool '{name}' not found")
+            return ToolResult.create_error(name, f"Tool '{name}' not found")
         
         if name not in self._functions:
-            return ToolResult.error(name, f"Function for tool '{name}' not found in registry")
+            return ToolResult.create_error(name, f"Function for tool '{name}' not found in registry")
         
         tool = self.tools[name]
         function = self._functions[name]
@@ -468,7 +468,7 @@ class ToolManager(BaseModel):
                     validated_input = tool.input_schema(**parameters)
                 except ValidationError as e:
                     execution_time = time.time() - start_time
-                    return ToolResult.error(
+                    return ToolResult.create_error(
                         name, 
                         f"Input validation failed: {e}",
                         execution_time=execution_time
@@ -519,7 +519,7 @@ class ToolManager(BaseModel):
             
             # Return standardized result
             if warnings:
-                return ToolResult.partial(
+                return ToolResult.create_partial(
                     tool_name=name,
                     data=validated_output if validated_output else raw_result,
                     warnings=warnings,
@@ -527,7 +527,7 @@ class ToolManager(BaseModel):
                     metadata={'input_validated': validated_input is not None}
                 )
             else:
-                return ToolResult.success(
+                return ToolResult.create_success(
                     tool_name=name,
                     data=validated_output if validated_output else raw_result,
                     execution_time=execution_time,
@@ -536,9 +536,9 @@ class ToolManager(BaseModel):
             
         except Exception as e:
             execution_time = time.time() - start_time
-            return ToolResult.error(
+            return ToolResult.create_error(
                 tool_name=name,
-                error=str(e),
+                error_msg=str(e),
                 execution_time=execution_time
             )
     

@@ -106,7 +106,17 @@ class StateSchema(BaseModel):
             'object': dict,
             'datetime': datetime
         }
-        return isinstance(value, type_map.get(expected_type, type(None)))
+        
+        expected = type_map.get(expected_type, type(None))
+        
+        # Special handling: Pydantic models are acceptable as "object"
+        # Since the entire framework is built on Pydantic, we should accept
+        # BaseModel instances when expecting object type
+        if expected_type == 'object':
+            from pydantic import BaseModel
+            return isinstance(value, (dict, BaseModel))
+        
+        return isinstance(value, expected)
     
     def _apply_validation_rule(self, key: str, value: Any, rule: Dict[str, Any]) -> Dict[str, Any]:
         """Apply custom validation rule"""
@@ -297,12 +307,33 @@ class StateManager(BaseModel):
                 temp_state = {**await self.get_all(), key: value}
                 validation_result = self.state_schema.validate_state(temp_state)
                 
-                if not validation_result['valid']:
-                    print(f"❌ State validation failed for key '{key}': {validation_result['errors']}")
+                # Only fail if THIS key has validation errors
+                # Missing required keys are OK during incremental state building
+                errors_about_this_key = [
+                    err for err in validation_result['errors'] 
+                    if f"'{key}'" in err or f"Validation failed for '{key}'" in err
+                ]
+                
+                # Missing required keys error is OK (they'll be set later)
+                missing_required_error = any("Missing required keys" in err for err in validation_result['errors'])
+                
+                if errors_about_this_key:
+                    print(f"❌ State validation failed for key '{key}': {errors_about_this_key}")
                     return False
                 
+                # Warn about missing required keys but don't fail (expected during workflow)
+                if missing_required_error and key not in self.state_schema.required_keys:
+                    # This is expected - we're setting a non-required key before all required keys exist
+                    pass
+                
                 if validation_result['warnings']:
-                    print(f"⚠️ State validation warnings for key '{key}': {validation_result['warnings']}")
+                    # Only show warnings for the key being set
+                    warnings_about_this_key = [
+                        warn for warn in validation_result['warnings'] 
+                        if f"'{key}'" in warn
+                    ]
+                    if warnings_about_this_key:
+                        print(f"⚠️ State validation warnings for key '{key}': {warnings_about_this_key}")
             
             # Store validated entry
             async with self._lock:

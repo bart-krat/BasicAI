@@ -21,6 +21,8 @@ from agent import create_openai_agent
 from state import create_state_manager, StateSchema
 from executor import create_executor, ExecutionPlan
 from tools import create_tool_manager
+from parser import YAMLParser
+import yaml
 
 # Import math tools registration from examples
 sys.path.insert(0, str(project_root / 'examples'))
@@ -126,7 +128,17 @@ async def solve_math_problem_with_agent():
     # ========================================================================
     problem = "Calculate: ((10 + 5) * 3) / (2^2) - √16"
     print(f"\n📝 Problem: {problem}")
-    await state.set("problem", problem)
+    
+    # Set problem in state
+    problem_set = await state.set("problem", problem)
+    if not problem_set:
+        print("⚠️  Warning: Failed to set 'problem' in state (validation may have failed)")
+    else:
+        print("✅ Successfully set 'problem' in state")
+    
+    # Verify it was saved
+    saved_problem = await state.get("problem")
+    print(f"🔍 Verified 'problem' in state: {saved_problem is not None}")
     
     # ========================================================================
     # STEP 3: Agent Generates Execution Plan
@@ -185,21 +197,89 @@ Now generate the complete plan for: {problem}
 Return ONLY the YAML, no other text.
 """
     
-    # Get plan from agent
-    plan_yaml = await agent.generate(
+    # Get plan from agent (raw LLM output, may contain markdown fences)
+    raw_plan = await agent.generate(
         prompt=planning_prompt,
         temperature=0.3,  # Lower temperature for more deterministic planning
         use_state=False,
         use_tools=False
     )
     
-    print("\n📋 Generated Plan:")
+    print("\n📋 Generated Plan (raw from LLM):")
     print("-" * 70)
-    print(plan_yaml)
+    print(raw_plan)
     print("-" * 70)
     
-    # Save plan to state
-    await state.set("plan_yaml", plan_yaml)
+    # Parse and clean YAML from LLM output (handles markdown fences, errors, etc.)
+    print("\n🔧 Parsing and cleaning YAML plan...")
+    yaml_parser = YAMLParser(safe_load=True, auto_fix=True)
+    parse_result = yaml_parser.parse(raw_plan)
+    
+    if not parse_result.success:
+        print(f"❌ Failed to parse YAML plan: {parse_result.error}")
+        raise ValueError(f"YAML parsing failed: {parse_result.error}")
+    
+    if parse_result.warnings:
+        print(f"⚠️  YAML parsing warnings: {parse_result.warnings}")
+    
+    # Convert parsed dict back to clean YAML string (no markdown fences)
+    clean_yaml = yaml.dump(parse_result.data, default_flow_style=False)
+    
+    # Verify the clean YAML can be parsed by executor
+    try:
+        test_plan = ExecutionPlan.from_yaml(clean_yaml)
+        print(f"\n✅ Clean YAML verified: Can be parsed by ExecutionPlan")
+        print(f"   - Task: {test_plan.task}")
+        print(f"   - Steps: {len(test_plan.steps)}")
+    except Exception as e:
+        print(f"\n❌ Clean YAML verification failed: {e}")
+        raise ValueError(f"Clean YAML cannot be parsed by ExecutionPlan: {e}")
+    
+    print("\n✅ Clean YAML plan ready:")
+    print("-" * 70)
+    print(clean_yaml)
+    print("-" * 70)
+    
+    # Save clean YAML to state (use "plan" to match schema requirement)
+    print("\n💾 Saving plan to state...")
+    plan_set = await state.set("plan", parse_result.data)  # Store as dict for easier access
+    
+    if not plan_set:
+        print("❌ Failed to set 'plan' in state (validation may have failed)")
+        raise ValueError("Failed to save plan to state")
+    else:
+        print("✅ Successfully set 'plan' in state")
+    
+    # Verify both required keys are now in state
+    print("\n🔍 Verifying state keys:")
+    saved_problem = await state.get("problem")
+    saved_plan = await state.get("plan")
+    
+    print(f"  - 'problem' in state: {saved_problem is not None} (value: {type(saved_problem).__name__})")
+    print(f"  - 'plan' in state: {saved_plan is not None} (value: {type(saved_plan).__name__})")
+    
+    if saved_plan:
+        print(f"  - Plan structure: task='{saved_plan.get('task', 'N/A')}', steps={len(saved_plan.get('steps', []))}")
+    
+    # Verify the plan structure matches ExecutionPlan expectations
+    if saved_plan:
+        required_plan_keys = ["task", "steps"]
+        missing_keys = [key for key in required_plan_keys if key not in saved_plan]
+        if missing_keys:
+            print(f"⚠️  Warning: Plan missing required keys: {missing_keys}")
+        else:
+            print("✅ Plan structure is valid (has 'task' and 'steps')")
+    
+    # Final validation: Check if state schema is satisfied
+    if state.state_schema:
+        all_state = await state.get_all()
+        final_validation = state.state_schema.validate_state(all_state)
+        if final_validation['valid']:
+            print("\n✅ Final state validation: PASSED (all required keys present)")
+        else:
+            print(f"\n⚠️  Final state validation: {final_validation['errors']}")
+            if final_validation['warnings']:
+                print(f"   Warnings: {final_validation['warnings']}")
     
     # ========================================================================
     # STEP 4: Execute the Plan
@@ -208,8 +288,8 @@ Return ONLY the YAML, no other text.
     print("="*70)
     
     try:
-        # Execute the plan
-        summary = await executor.execute_plan(plan_yaml)
+        # Execute the plan (executor receives clean YAML, ready for execution)
+        summary = await executor.execute_plan(clean_yaml)
         
         print("\n" + "="*70)
         print("📊 Execution Summary")
@@ -365,8 +445,7 @@ async def main():
     await solve_math_problem_with_agent()
     
     # Run manual plan for comparison
-    print("\n\n")
-    await solve_with_manual_plan()
+    
 
 
 if __name__ == "__main__":
